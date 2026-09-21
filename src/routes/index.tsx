@@ -121,14 +121,25 @@ const PROMPT_RANGE = 15;
  * those panels are rendered side by side inside that one environment, where a
  * single limiter sees every request. Same speed, one source of truth.
  */
-const IMAGE_CONCURRENCY = 1;
 /**
- * Panels rendered together, in parallel, inside one server environment.
- * The server holds a pool of Agnes keys (one free account each) and hands each
- * panel to whichever key is free, so a group of this size runs side by side
- * without any single account exceeding its own limit.
+ * Independent lanes, each carrying ONE panel per request.
+ *
+ * A single nine-panel request meant the page showed nothing until the slowest
+ * of the nine answered, and one throttled panel held the whole group (and its
+ * server environment) open. Separate small requests let every finished panel
+ * appear the moment it is done, and a slow one only blocks its own lane.
+ * Five lanes stays under the six simultaneous connections a serverless edge
+ * environment / browser host allows.
  */
-const IMAGE_BATCH = 9;
+const IMAGE_CONCURRENCY = 5;
+/** Panels carried by one request. One = per-panel progress, no head-of-line stall. */
+const IMAGE_BATCH = 1;
+/**
+ * Provider throttling does not consume a render attempt, but it cannot be
+ * retried forever either: after this many rate-limited rounds the panel is
+ * marked failed instead of circling the queue invisibly.
+ */
+const MAX_RATE_LIMIT_WAITS = 30;
 
 /** True when a failure message is provider capacity pressure, not a bad panel. */
 function isRateLimitMessage(msg: string): boolean {
