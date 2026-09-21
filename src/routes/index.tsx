@@ -950,10 +950,16 @@ function Index() {
           const requeue = (g: Job, msg: string) => {
             const limited = isRateLimitMessage(msg);
             const nextAttempts = limited ? g.attempts : g.attempts + 1;
-            if (nextAttempts < MAX_IMAGE_ATTEMPTS && !cancelRef.current) {
-              // Provider capacity is not a bad panel attempt. Keep it queued
-              // indefinitely and spend attempts only on actual render errors.
-              queue.push({ ...g, attempts: nextAttempts });
+            // Provider capacity is not a bad panel attempt, but it is counted
+            // separately so a permanently throttled panel cannot loop forever
+            // and make a finished run look stuck.
+            const nextWaits = (g.waits ?? 0) + (limited ? 1 : 0);
+            const canRetry =
+              nextAttempts < MAX_IMAGE_ATTEMPTS && nextWaits <= MAX_RATE_LIMIT_WAITS;
+            if (canRetry && !cancelRef.current) {
+              // Throttled work goes to the BACK of the queue so healthy panels
+              // keep flowing past it.
+              queue.push({ ...g, attempts: nextAttempts, waits: nextWaits });
               record(g.seg.index, { status: "waiting", error: undefined });
             } else {
               record(g.seg.index, { status: "error", prompt: g.prompt, error: msg });
