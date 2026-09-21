@@ -1007,71 +1007,42 @@ function Index() {
               }),
               IMAGE_REQUEST_DEADLINE_MS,
             );
-            const results = [{ index: job.seg.index, ...result }];
-            await Promise.all(
-              results.map(async (r) => {
-                const job = group.find((g) => g.seg.index === r.index);
-                if (r.url) {
-                  // Pixel-level blank check in the browser: a flat/empty frame
-                  // is re-rolled on a fresh seed and key so every timestamp
-                  // ends up with a real image.
-                  let url: string | null = r.url;
-                  // the review pass may have rewritten the prompt server-side
-                  const prompt = r.prompt ?? job?.prompt ?? "";
-                  for (let attempt = 1; attempt <= 2; attempt++) {
-                    if (!url || !CLIENT_BLANK_CHECK || !(await isBlankImageUrl(url))) break;
-                    url = null;
-                    if (!prompt) break;
-                    try {
-                      const res = await killable((signal) =>
-                        draw({
-                          data: {
-                            ...stamp(),
-                            prompt,
-                            seed: 1000 + r.index + attempt * 7919,
-                            bible: b,
-                            slot: keyTick++,
-                            line: job?.seg.text,
-                            ...(job ? { timestamp: `${job.seg.start}s-${job.seg.end}s` } : {}),
-                          },
-                          signal,
-                        }),
-                        IMAGE_REQUEST_DEADLINE_MS,
-                      );
-                      url = res.url;
-                    } catch (e) {
-                      logFailure("draw", `Panel #${r.index + 1}: single redraw failed`, e);
-                      url = null;
-                    }
-                  }
-                  if (url && (!CLIENT_BLANK_CHECK || !(await isBlankImageUrl(url)))) {
-                    record(r.index, { url, prompt, status: "done", error: undefined });
-                  } else if (job) {
-                    logWarn("draw", `Panel #${r.index + 1}: blank image came back — queued again`);
-                    requeue(job, "blank image");
-                  } else {
-                    logFailure("draw", `Panel #${r.index + 1}: blank image, no retry left`);
-                    record(r.index, { status: "error", error: "blank image" });
-                  }
-                  return;
-                }
-                // Waiting for the image service's per-minute budget is normal
-                // pacing, not a failure: the panel goes back in the queue and
-                // is drawn a moment later, so it must not be logged as an error.
-                const reason = r.error ?? "render failed";
-                const paced = /429|rate limit|1015|too many requests/i.test(reason);
-                if (paced && job) {
-                  logWarn("draw", `Panel #${r.index + 1}: waiting its turn (image limit) — will retry`);
-                } else {
-                  logFailure("draw", `Panel #${r.index + 1} did not render: ${reason}`);
-                }
-                if (job) {
-                  requeue(job, r.error ?? "render failed");
-                } else {
-                  record(r.index, { status: "error", error: r.error ?? "render failed" });
-                }
-              }),
-            );
+            // This is intentionally a direct one-panel result. There is no
+            // batch promise left that can hide a completed panel behind a slow
+            // sibling request.
+            let url: string | null = result.url;
+            const prompt = result.prompt ?? job.prompt;
+            for (let attempt = 1; attempt <= 2; attempt++) {
+              if (!url || !CLIENT_BLANK_CHECK || !(await isBlankImageUrl(url))) break;
+              url = null;
+              try {
+                const res = await killable((signal) =>
+                  draw({
+                    data: {
+                      ...stamp(),
+                      prompt,
+                      seed: 1000 + job.seg.index + attempt * 7919,
+                      bible: b,
+                      slot: keyTick++,
+                      line: job.seg.text,
+                      timestamp: `${job.seg.start}s-${job.seg.end}s`,
+                    },
+                    signal,
+                  }),
+                  IMAGE_REQUEST_DEADLINE_MS,
+                );
+                url = res.url;
+              } catch (e) {
+                logFailure("draw", `Panel #${job.seg.index + 1}: single redraw failed`, e);
+                url = null;
+              }
+            }
+            if (url && (!CLIENT_BLANK_CHECK || !(await isBlankImageUrl(url)))) {
+              record(job.seg.index, { url, prompt, status: "done", error: undefined });
+            } else {
+              logWarn("draw", `Panel #${job.seg.index + 1}: blank image came back — queued again`);
+              requeue(job, "blank image");
+            }
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
             console.error(
