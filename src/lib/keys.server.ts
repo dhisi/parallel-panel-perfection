@@ -117,7 +117,7 @@ export function noteRateLimit(retryAfterMs?: number, hard = false, keyIndex = 0)
   const backoff = hard
     ? 60_000
     : retryAfterMs && retryAfterMs > 0
-      ? Math.min(Math.max(retryAfterMs, 2_000), 20_000)
+      ? Math.min(Math.max(retryAfterMs, 2_000), 15 * 60_000)
       : Math.min(3_000 + 2_000 * (s.throttleLevel - 1), 12_000);
   s.cooldownUntil = Math.max(s.cooldownUntil, Date.now() + backoff);
   return backoff;
@@ -153,8 +153,11 @@ function waitFor(s: KeyState, now: number): number {
   return 0;
 }
 
-/** Longest a single server call may sit in this gate. */
-const MAX_GATE_WAIT_MS = 90_000;
+/**
+ * Keep server calls short. Provider cooldown belongs to the continuous browser
+ * run, not an isolated server instance that may disappear while waiting.
+ */
+const MAX_GATE_WAIT_MS = 5_000;
 
 /** Round-robin cursor so consecutive renders spread across the pool. */
 let cursor = 0;
@@ -191,7 +194,7 @@ export async function withImageKey<T>(
     }
     if (picked >= 0) break;
     if (now + best > deadline) {
-      throw new Error("429 rate limited, waiting 90s (local pacing gate)");
+      throw new Error(`429 rate limited, waiting ${Math.max(1, Math.ceil(best / 1000))}s`);
     }
     await sleep(Math.min(best, 400));
   }

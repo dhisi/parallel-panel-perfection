@@ -131,7 +131,7 @@ const PROMPT_RANGE = 15;
  * Five lanes stays under the six simultaneous connections a serverless edge
  * environment / browser host allows.
  */
-const IMAGE_CONCURRENCY = 5;
+const IMAGE_CONCURRENCY = 1;
 /** Panels carried by one request. One = per-panel progress, no head-of-line stall. */
 const IMAGE_BATCH = 1;
 /**
@@ -139,7 +139,7 @@ const IMAGE_BATCH = 1;
  * retried forever either: after this many rate-limited rounds the panel is
  * marked failed instead of circling the queue invisibly.
  */
-const MAX_RATE_LIMIT_WAITS = 12;
+const MAX_RATE_LIMIT_WAITS = 3;
 
 /** True when a failure message is provider capacity pressure, not a bad panel. */
 function isRateLimitMessage(msg: string): boolean {
@@ -150,7 +150,7 @@ function isRateLimitMessage(msg: string): boolean {
 function rateLimitWaitMs(msg: string): number {
   const seconds = /waiting\s+(\d+)s/i.exec(msg)?.[1];
   const parsed = seconds ? Number(seconds) * 1000 : 20_000;
-  return Math.min(60_000, Math.max(5_000, parsed));
+  return Math.min(15 * 60_000, Math.max(5_000, parsed));
 }
 
 
