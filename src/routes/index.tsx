@@ -694,7 +694,7 @@ function Index() {
       tick(true);
 
       let keyTick = 0;
-      type Job = { seg: Shot; prompt: string; attempts: number };
+      type Job = { seg: Shot; prompt: string; attempts: number; waits?: number };
       // Only lines that actually HAVE a prompt may enter the render queue.
       const queue: Job[] = [];
       /** Timestamps already handed to the renderer, so nothing is drawn twice. */
@@ -703,7 +703,7 @@ function Index() {
       const enqueue = (seg: Shot, prompt: string) => {
         if (queued.has(seg.index)) return;
         queued.add(seg.index);
-        queue.push({ seg, prompt: prompt.trim(), attempts: 0 });
+        queue.push({ seg, prompt: prompt.trim(), attempts: 0, waits: 0 });
       };
       for (const s of pending) {
         if (hasPrompt(s.prompt) && !s.url) enqueue(s, s.prompt as string);
