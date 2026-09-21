@@ -109,13 +109,15 @@ function spacing(s: KeyState): number {
  * a single lane on that key until a render succeeds again.
  */
 export function noteRateLimit(retryAfterMs?: number, hard = false, keyIndex = 0): number {
-  const s = states()[keyIndex] ?? states()[0]!;
+  const all = states();
+  const s = all[keyIndex] ?? all[0];
+  if (!s) throw new Error("Missing AGNES_API_KEY (Agnes AI image key)");
   s.throttleLevel = Math.min(s.throttleLevel + 1, 3);
   if (hard) s.hardBlocked = true;
   const backoff = hard
     ? 60_000
     : retryAfterMs && retryAfterMs > 0
-      ? Math.min(Math.max(retryAfterMs, 2_000), 20_000)
+      ? Math.min(Math.max(retryAfterMs, 2_000), 15 * 60_000)
       : Math.min(3_000 + 2_000 * (s.throttleLevel - 1), 12_000);
   s.cooldownUntil = Math.max(s.cooldownUntil, Date.now() + backoff);
   return backoff;
@@ -151,8 +153,11 @@ function waitFor(s: KeyState, now: number): number {
   return 0;
 }
 
-/** Longest a single server call may sit in this gate. */
-const MAX_GATE_WAIT_MS = 90_000;
+/**
+ * Keep server calls short. Provider cooldown belongs to the continuous browser
+ * run, not an isolated server instance that may disappear while waiting.
+ */
+const MAX_GATE_WAIT_MS = 5_000;
 
 /** Round-robin cursor so consecutive renders spread across the pool. */
 let cursor = 0;
@@ -163,18 +168,23 @@ let cursor = 0;
  * `noteRateLimit`/`noteImageSuccess` so throttling stays per key.
  */
 export async function withImageKey<T>(
-  _slot: number,
+  slot: number,
   _attempt: number,
   fn: (key: string, keyIndex: number) => Promise<T>,
 ): Promise<T> {
   const all = states();
   const deadline = Date.now() + MAX_GATE_WAIT_MS;
   let picked = -1;
+  // A serverless request can start in a fresh isolate, where the module-level
+  // cursor is always zero. Use the browser-issued slot as the first choice so
+  // separate one-panel requests actually spread across every configured key
+  // instead of repeatedly hammering key #1.
+  const preferred = ((slot % all.length) + all.length) % all.length;
   for (;;) {
     const now = Date.now();
     let best = Number.POSITIVE_INFINITY;
     for (let i = 0; i < all.length; i++) {
-      const idx = (cursor + i) % all.length;
+      const idx = (preferred + cursor + i) % all.length;
       const wait = waitFor(all[idx] as KeyState, now);
       if (wait <= 0) {
         picked = idx;
@@ -184,7 +194,7 @@ export async function withImageKey<T>(
     }
     if (picked >= 0) break;
     if (now + best > deadline) {
-      throw new Error("429 rate limited, waiting 90s (local pacing gate)");
+      throw new Error(`429 rate limited, waiting ${Math.max(1, Math.ceil(best / 1000))}s`);
     }
     await sleep(Math.min(best, 400));
   }

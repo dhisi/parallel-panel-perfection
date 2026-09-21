@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { analyzeScript, renderImage, renderBatch } from "@/lib/manga.functions";
+import { analyzeScript, renderImage } from "@/lib/manga.functions";
 
 import { buildTimeline, fmt, parseScript, scriptEndTime, type Segment } from "@/lib/script";
 import { buildVideo, webCodecsSupported } from "@/lib/video";
@@ -131,7 +131,7 @@ const PROMPT_RANGE = 15;
  * Five lanes stays under the six simultaneous connections a serverless edge
  * environment / browser host allows.
  */
-const IMAGE_CONCURRENCY = 5;
+const IMAGE_CONCURRENCY = 1;
 /** Panels carried by one request. One = per-panel progress, no head-of-line stall. */
 const IMAGE_BATCH = 1;
 /**
@@ -139,11 +139,18 @@ const IMAGE_BATCH = 1;
  * retried forever either: after this many rate-limited rounds the panel is
  * marked failed instead of circling the queue invisibly.
  */
-const MAX_RATE_LIMIT_WAITS = 30;
+const MAX_RATE_LIMIT_WAITS = 3;
 
 /** True when a failure message is provider capacity pressure, not a bad panel. */
 function isRateLimitMessage(msg: string): boolean {
   return /\b429\b|rate.?limit|too many requests|quota|1015/i.test(msg);
+}
+
+/** Honor the provider's stated wait instead of immediately starting another wave. */
+function rateLimitWaitMs(msg: string): number {
+  const seconds = /waiting\s+(\d+)s/i.exec(msg)?.[1];
+  const parsed = seconds ? Number(seconds) * 1000 : 20_000;
+  return Math.min(15 * 60_000, Math.max(5_000, parsed));
 }
 
 
@@ -423,7 +430,6 @@ function Index() {
   const analyze = useServerFn(analyzeScript);
 
   const draw = useServerFn(renderImage);
-  const drawBatch = useServerFn(renderBatch);
   const killRuns = useServerFn(instaKill);
 
   const [script, setScript] = useState("");
@@ -718,6 +724,9 @@ function Index() {
       const MAX_IMAGE_ATTEMPTS = 10;
 
       let promptingDone = ranges.length === 0;
+      // Shared by every drawing lane in this page. One 429 pauses all lanes,
+      // preventing five workers from extending the same provider block.
+      let imageCooldownUntil = 0;
 
       const record = (index: number, next: Partial<Shot>) => {
         list = list.map((x) => (x.index === index ? { ...x, ...next } : x));
@@ -923,6 +932,14 @@ function Index() {
         console.log(`[client] worker ${me} started`);
         for (;;) {
           if (cancelRef.current) return;
+          const cooldownLeft = imageCooldownUntil - Date.now();
+          if (cooldownLeft > 0) {
+            setNote(
+              `Image service is busy — retrying in ${Math.ceil(cooldownLeft / 1000)}s · panels ${drawn}/${total}`,
+            );
+            await new Promise((r) => setTimeout(r, Math.min(1000, cooldownLeft)));
+            continue;
+          }
           const group = queue.splice(0, IMAGE_BATCH);
           if (group.length === 0) {
             if (promptingDone && inFlight === 0) {
@@ -954,6 +971,9 @@ function Index() {
             // separately so a permanently throttled panel cannot loop forever
             // and make a finished run look stuck.
             const nextWaits = (g.waits ?? 0) + (limited ? 1 : 0);
+            if (limited) {
+              imageCooldownUntil = Math.max(imageCooldownUntil, Date.now() + rateLimitWaitMs(msg));
+            }
             const canRetry =
               nextAttempts < MAX_IMAGE_ATTEMPTS && nextWaits <= MAX_RATE_LIMIT_WAITS;
             if (canRetry && !cancelRef.current) {
@@ -970,88 +990,59 @@ function Index() {
             `[client] worker ${me} drawing panels ${group.map((g) => g.seg.index + 1).join(",")} · queue=${queue.length}`,
           );
           try {
-            const { results } = await killable((signal) =>
-              drawBatch({
+            const job = group[0];
+            if (!job) continue;
+            const result = await killable((signal) =>
+              draw({
                 data: {
                   ...stamp(),
+                  prompt: job.prompt,
+                  seed: 1000 + job.seg.index + job.attempts * 7919,
                   bible: b,
-                  jobs: group.map((g) => ({
-                    index: g.seg.index,
-                    prompt: g.prompt,
-                    seed: 1000 + g.seg.index + g.attempts * 7919,
-                    slot: keyTick++,
-                    line: g.seg.text,
-                    timestamp: `${g.seg.start}s-${g.seg.end}s`,
-                  })),
+                  slot: keyTick++,
+                  line: job.seg.text,
+                  timestamp: `${job.seg.start}s-${job.seg.end}s`,
                 },
                 signal,
               }),
               IMAGE_REQUEST_DEADLINE_MS,
             );
-            await Promise.all(
-              results.map(async (r) => {
-                const job = group.find((g) => g.seg.index === r.index);
-                if (r.url) {
-                  // Pixel-level blank check in the browser: a flat/empty frame
-                  // is re-rolled on a fresh seed and key so every timestamp
-                  // ends up with a real image.
-                  let url: string | null = r.url;
-                  // the review pass may have rewritten the prompt server-side
-                  const prompt = r.prompt ?? job?.prompt ?? "";
-                  for (let attempt = 1; attempt <= 2; attempt++) {
-                    if (!url || !CLIENT_BLANK_CHECK || !(await isBlankImageUrl(url))) break;
-                    url = null;
-                    if (!prompt) break;
-                    try {
-                      const res = await killable((signal) =>
-                        draw({
-                          data: {
-                            ...stamp(),
-                            prompt,
-                            seed: 1000 + r.index + attempt * 7919,
-                            bible: b,
-                            slot: keyTick++,
-                            line: job?.seg.text,
-                            ...(job ? { timestamp: `${job.seg.start}s-${job.seg.end}s` } : {}),
-                          },
-                          signal,
-                        }),
-                        IMAGE_REQUEST_DEADLINE_MS,
-                      );
-                      url = res.url;
-                    } catch (e) {
-                      logFailure("draw", `Panel #${r.index + 1}: single redraw failed`, e);
-                      url = null;
-                    }
-                  }
-                  if (url && (!CLIENT_BLANK_CHECK || !(await isBlankImageUrl(url)))) {
-                    record(r.index, { url, prompt, status: "done", error: undefined });
-                  } else if (job) {
-                    logWarn("draw", `Panel #${r.index + 1}: blank image came back — queued again`);
-                    requeue(job, "blank image");
-                  } else {
-                    logFailure("draw", `Panel #${r.index + 1}: blank image, no retry left`);
-                    record(r.index, { status: "error", error: "blank image" });
-                  }
-                  return;
-                }
-                // Waiting for the image service's per-minute budget is normal
-                // pacing, not a failure: the panel goes back in the queue and
-                // is drawn a moment later, so it must not be logged as an error.
-                const reason = r.error ?? "render failed";
-                const paced = /429|rate limit|1015|too many requests/i.test(reason);
-                if (paced && job) {
-                  logWarn("draw", `Panel #${r.index + 1}: waiting its turn (image limit) — will retry`);
-                } else {
-                  logFailure("draw", `Panel #${r.index + 1} did not render: ${reason}`);
-                }
-                if (job) {
-                  requeue(job, r.error ?? "render failed");
-                } else {
-                  record(r.index, { status: "error", error: r.error ?? "render failed" });
-                }
-              }),
-            );
+            // This is intentionally a direct one-panel result. There is no
+            // batch promise left that can hide a completed panel behind a slow
+            // sibling request.
+            let url: string | null = result.url;
+            const prompt = result.prompt ?? job.prompt;
+            for (let attempt = 1; attempt <= 2; attempt++) {
+              if (!url || !CLIENT_BLANK_CHECK || !(await isBlankImageUrl(url))) break;
+              url = null;
+              try {
+                const res = await killable((signal) =>
+                  draw({
+                    data: {
+                      ...stamp(),
+                      prompt,
+                      seed: 1000 + job.seg.index + attempt * 7919,
+                      bible: b,
+                      slot: keyTick++,
+                      line: job.seg.text,
+                      timestamp: `${job.seg.start}s-${job.seg.end}s`,
+                    },
+                    signal,
+                  }),
+                  IMAGE_REQUEST_DEADLINE_MS,
+                );
+                url = res.url;
+              } catch (e) {
+                logFailure("draw", `Panel #${job.seg.index + 1}: single redraw failed`, e);
+                url = null;
+              }
+            }
+            if (url && (!CLIENT_BLANK_CHECK || !(await isBlankImageUrl(url)))) {
+              record(job.seg.index, { url, prompt, status: "done", error: undefined });
+            } else {
+              logWarn("draw", `Panel #${job.seg.index + 1}: blank image came back — queued again`);
+              requeue(job, "blank image");
+            }
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
             console.error(
