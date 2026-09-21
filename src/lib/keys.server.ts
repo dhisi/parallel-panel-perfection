@@ -109,7 +109,9 @@ function spacing(s: KeyState): number {
  * a single lane on that key until a render succeeds again.
  */
 export function noteRateLimit(retryAfterMs?: number, hard = false, keyIndex = 0): number {
-  const s = states()[keyIndex] ?? states()[0]!;
+  const all = states();
+  const s = all[keyIndex] ?? all[0];
+  if (!s) throw new Error("Missing AGNES_API_KEY (Agnes AI image key)");
   s.throttleLevel = Math.min(s.throttleLevel + 1, 3);
   if (hard) s.hardBlocked = true;
   const backoff = hard
@@ -163,18 +165,23 @@ let cursor = 0;
  * `noteRateLimit`/`noteImageSuccess` so throttling stays per key.
  */
 export async function withImageKey<T>(
-  _slot: number,
+  slot: number,
   _attempt: number,
   fn: (key: string, keyIndex: number) => Promise<T>,
 ): Promise<T> {
   const all = states();
   const deadline = Date.now() + MAX_GATE_WAIT_MS;
   let picked = -1;
+  // A serverless request can start in a fresh isolate, where the module-level
+  // cursor is always zero. Use the browser-issued slot as the first choice so
+  // separate one-panel requests actually spread across every configured key
+  // instead of repeatedly hammering key #1.
+  const preferred = ((slot % all.length) + all.length) % all.length;
   for (;;) {
     const now = Date.now();
     let best = Number.POSITIVE_INFINITY;
     for (let i = 0; i < all.length; i++) {
-      const idx = (cursor + i) % all.length;
+      const idx = (preferred + cursor + i) % all.length;
       const wait = waitFor(all[idx] as KeyState, now);
       if (wait <= 0) {
         picked = idx;

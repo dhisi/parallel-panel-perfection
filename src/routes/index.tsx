@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { analyzeScript, renderImage, renderBatch } from "@/lib/manga.functions";
+import { analyzeScript, renderImage } from "@/lib/manga.functions";
 
 import { buildTimeline, fmt, parseScript, scriptEndTime, type Segment } from "@/lib/script";
 import { buildVideo, webCodecsSupported } from "@/lib/video";
@@ -139,11 +139,18 @@ const IMAGE_BATCH = 1;
  * retried forever either: after this many rate-limited rounds the panel is
  * marked failed instead of circling the queue invisibly.
  */
-const MAX_RATE_LIMIT_WAITS = 30;
+const MAX_RATE_LIMIT_WAITS = 12;
 
 /** True when a failure message is provider capacity pressure, not a bad panel. */
 function isRateLimitMessage(msg: string): boolean {
   return /\b429\b|rate.?limit|too many requests|quota|1015/i.test(msg);
+}
+
+/** Honor the provider's stated wait instead of immediately starting another wave. */
+function rateLimitWaitMs(msg: string): number {
+  const seconds = /waiting\s+(\d+)s/i.exec(msg)?.[1];
+  const parsed = seconds ? Number(seconds) * 1000 : 20_000;
+  return Math.min(60_000, Math.max(5_000, parsed));
 }
 
 
@@ -423,7 +430,6 @@ function Index() {
   const analyze = useServerFn(analyzeScript);
 
   const draw = useServerFn(renderImage);
-  const drawBatch = useServerFn(renderBatch);
   const killRuns = useServerFn(instaKill);
 
   const [script, setScript] = useState("");
@@ -718,6 +724,9 @@ function Index() {
       const MAX_IMAGE_ATTEMPTS = 10;
 
       let promptingDone = ranges.length === 0;
+      // Shared by every drawing lane in this page. One 429 pauses all lanes,
+      // preventing five workers from extending the same provider block.
+      let imageCooldownUntil = 0;
 
       const record = (index: number, next: Partial<Shot>) => {
         list = list.map((x) => (x.index === index ? { ...x, ...next } : x));
@@ -923,6 +932,14 @@ function Index() {
         console.log(`[client] worker ${me} started`);
         for (;;) {
           if (cancelRef.current) return;
+          const cooldownLeft = imageCooldownUntil - Date.now();
+          if (cooldownLeft > 0) {
+            setNote(
+              `Image service is busy — retrying in ${Math.ceil(cooldownLeft / 1000)}s · panels ${drawn}/${total}`,
+            );
+            await new Promise((r) => setTimeout(r, Math.min(1000, cooldownLeft)));
+            continue;
+          }
           const group = queue.splice(0, IMAGE_BATCH);
           if (group.length === 0) {
             if (promptingDone && inFlight === 0) {
@@ -954,6 +971,9 @@ function Index() {
             // separately so a permanently throttled panel cannot loop forever
             // and make a finished run look stuck.
             const nextWaits = (g.waits ?? 0) + (limited ? 1 : 0);
+            if (limited) {
+              imageCooldownUntil = Math.max(imageCooldownUntil, Date.now() + rateLimitWaitMs(msg));
+            }
             const canRetry =
               nextAttempts < MAX_IMAGE_ATTEMPTS && nextWaits <= MAX_RATE_LIMIT_WAITS;
             if (canRetry && !cancelRef.current) {
@@ -970,24 +990,24 @@ function Index() {
             `[client] worker ${me} drawing panels ${group.map((g) => g.seg.index + 1).join(",")} · queue=${queue.length}`,
           );
           try {
-            const { results } = await killable((signal) =>
-              drawBatch({
+            const job = group[0];
+            if (!job) continue;
+            const result = await killable((signal) =>
+              draw({
                 data: {
                   ...stamp(),
+                  prompt: job.prompt,
+                  seed: 1000 + job.seg.index + job.attempts * 7919,
                   bible: b,
-                  jobs: group.map((g) => ({
-                    index: g.seg.index,
-                    prompt: g.prompt,
-                    seed: 1000 + g.seg.index + g.attempts * 7919,
-                    slot: keyTick++,
-                    line: g.seg.text,
-                    timestamp: `${g.seg.start}s-${g.seg.end}s`,
-                  })),
+                  slot: keyTick++,
+                  line: job.seg.text,
+                  timestamp: `${job.seg.start}s-${job.seg.end}s`,
                 },
                 signal,
               }),
               IMAGE_REQUEST_DEADLINE_MS,
             );
+            const results = [{ index: job.seg.index, ...result }];
             await Promise.all(
               results.map(async (r) => {
                 const job = group.find((g) => g.seg.index === r.index);
